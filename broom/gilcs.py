@@ -3,8 +3,9 @@ import healpy as hp
 import sys
 from .configurations import Configs
 from .routines import _get_local_cov, _EB_to_QU, _E_to_QU, _B_to_QU, obj_to_array, array_to_obj, _log, _get_bandwidths
-from .saving import _save_compsep_products, _get_full_path_out, save_ilc_weights
+from .saving import _save_compsep_products, _get_full_path_out, save_ilc_weights, _get_full_path_nuiscov, update_and_save_nuiscov_serial, load_nuiscov
 from .needlets import _get_nside_lmax_from_b_ell, _get_needlet_windows_, _needlet_filtering, _get_good_channels_nl
+from .masking import _downgrade_mask
 from .ilcs import get_ilc_cov
 from .seds import _get_CMB_SED
 import scipy
@@ -74,13 +75,16 @@ def gilc(config: Configs, input_alms: SimpleNamespace, compsep_run: Dict[str, An
 
     compsep_run = _standardize_gnilc_run(compsep_run, input_alms.total.shape[0], config.lmax)
     
-    compsep_run["nuis_idx"] = get_nuisance_idx(input_alms, compsep_run, config.verbose)
+    if not ("load_nuisance_covariance" in compsep_run and compsep_run["load_nuisance_covariance"]):
+        compsep_run["nuis_idx"] = get_nuisance_idx(input_alms, compsep_run, config.verbose)
     if np.any(np.array(compsep_run["cov_noise_debias"]) != 0.):
-        if not hasattr(input_alms, "noise"):
-            raise ValueError("The input_alms object must have 'noise'' attribute for debiasing the covariance.")
-        compsep_run["noise_idx"] = 2 if hasattr(input_alms, "fgds") else 1
+        if not ("load_noise_covariance" in compsep_run and compsep_run["load_noise_covariance"]):
+            if not hasattr(input_alms, "noise"):
+                raise ValueError("The input_alms object must have 'noise'' attribute for debiasing the covariance.")
+            compsep_run["noise_idx"] = 2 if hasattr(input_alms, "fgds") else 1
 #    print("Using nuisance alms with indices:", compsep_run["nuis_idx"])
 
+    input_attrs = obj_to_array(input_alms, return_attributes=True)
     output_maps = _gilc(config, obj_to_array(input_alms), compsep_run, **kwargs)
     
     output_maps = _gilc_post_processing(config, output_maps, compsep_run, **kwargs)
@@ -88,15 +92,10 @@ def gilc(config: Configs, input_alms: SimpleNamespace, compsep_run: Dict[str, An
     compsep_run.pop("nuis_idx", None)
     compsep_run.pop("noise_idx", None)
 
-    outputs = array_to_obj(output_maps, input_alms)
+    outputs = array_to_obj(output_maps, input_attrs)
     del output_maps
 
-    if config.save_compsep_products:
-        _save_compsep_products(config, outputs, compsep_run, nsim=compsep_run["nsim"])
-    
-    if config.return_compsep_products:
-        return outputs
-    return None
+    return outputs, compsep_run
 
 def fgd_diagnostic(config: Configs, input_alms: SimpleNamespace, compsep_run: Dict[str, Any], **kwargs) -> Optional[SimpleNamespace]:
     """
@@ -150,25 +149,33 @@ def fgd_diagnostic(config: Configs, input_alms: SimpleNamespace, compsep_run: Di
     if not "cmb_nuisance" in compsep_run:
         compsep_run["cmb_nuisance"] = True            
      
-    compsep_run["nuis_idx"] = get_nuisance_idx(input_alms, compsep_run, config.verbose)
-    if np.any(np.array(compsep_run["cov_noise_debias"]) != 0.):
-        if not hasattr(input_alms, "noise"):
-            raise ValueError("The input_alms object must have 'noise'' attribute for debiasing the covariance.")
-        compsep_run["noise_idx"] = 2 if hasattr(input_alms, "fgds") else 1
-
-    if isinstance(compsep_run["nuis_idx"], int):
-        nuis_alms = (obj_to_array(input_alms))[...,compsep_run["nuis_idx"]]
-    elif isinstance(compsep_run["nuis_idx"], list):
-        nuis_alms = (obj_to_array(input_alms))[...,compsep_run["nuis_idx"][0]] + (obj_to_array(input_alms))[...,compsep_run["nuis_idx"][1]]
-    inputs_alms_for_diagn = np.concatenate([
-        input_alms.total[...,np.newaxis],
-        nuis_alms[...,np.newaxis]],axis=-1)
-    del nuis_alms
+    if not ("load_nuisance_covariance" in compsep_run and compsep_run["load_nuisance_covariance"]):
+        compsep_run["nuis_idx"] = get_nuisance_idx(input_alms, compsep_run, config.verbose)
+        if isinstance(compsep_run["nuis_idx"], int):
+            nuis_alms = (obj_to_array(input_alms))[...,compsep_run["nuis_idx"]]
+        elif isinstance(compsep_run["nuis_idx"], list):
+            nuis_alms = (obj_to_array(input_alms))[...,compsep_run["nuis_idx"][0]] + (obj_to_array(input_alms))[...,compsep_run["nuis_idx"][1]]
+        compsep_run["nuis_idx"] = 1
 
     if np.any(np.array(compsep_run["cov_noise_debias"]) != 0.):
-        noi_alms = (obj_to_array(input_alms))[...,compsep_run["noise_idx"]]
-        inputs_alms_for_diagn = np.concatenate([inputs_alms_for_diagn, noi_alms[...,np.newaxis]], axis=-1)
-        del noi_alms
+        if not ("load_noise_covariance" in compsep_run and compsep_run["load_noise_covariance"]):
+            if not hasattr(input_alms, "noise"):
+                raise ValueError("The input_alms object must have 'noise'' attribute for debiasing the covariance.")
+            compsep_run["noise_idx"] = 2 if hasattr(input_alms, "fgds") else 1
+            noi_alms = (obj_to_array(input_alms))[...,compsep_run["noise_idx"]]
+            if not ("load_nuisance_covariance" in compsep_run and compsep_run["load_nuisance_covariance"]):
+                compsep_run["noise_idx"] = 2
+            else:
+                compsep_run["noise_idx"] = 1
+
+    input_alms_for_diagn = input_alms.total[...,np.newaxis]
+    if not ("load_nuisance_covariance" in compsep_run and compsep_run["load_nuisance_covariance"]):
+        input_alms_for_diagn = np.concatenate([input_alms_for_diagn, nuis_alms[...,np.newaxis]], axis=-1)
+        del nuis_alms
+    if np.any(np.array(compsep_run["cov_noise_debias"]) != 0.):
+        if not ("load_noise_covariance" in compsep_run and compsep_run["load_noise_covariance"]):
+            inputs_alms_for_diagn = np.concatenate([inputs_alms_for_diagn, noi_alms[...,np.newaxis]], axis=-1)
+            del noi_alms
 
     output_maps = _fgd_diagnostic(config, inputs_alms_for_diagn, compsep_run)
     del inputs_alms_for_diagn
@@ -180,12 +187,7 @@ def fgd_diagnostic(config: Configs, input_alms: SimpleNamespace, compsep_run: Di
 
     del output_maps
 
-    if config.save_compsep_products:
-        _save_compsep_products(config, outputs, compsep_run, nsim=compsep_run["nsim"])
-    
-    if config.return_compsep_products:
-        return outputs
-    return None
+    return outputs, compsep_run
 
 def get_nuisance_idx(
     input_alms: SimpleNamespace,
@@ -349,6 +351,50 @@ def _gilc(config: Configs, input_alms: np.ndarray, compsep_run: Dict[str, Any], 
     
     return output_maps
 
+def compute_and_update_nuisance_covariance(config: Configs, nuis_alms: np.ndarray, nuis_case: Dict[str, Any], nsim: Optional[Union[int, str]], **kwargs) -> None:
+    """
+    Computes the nuisance covariance matrix and updates the stored estimate in disk.
+
+    Parameters
+    ----------
+        config: Configs
+            Configuration object with general settings.
+        nuis_alms: np.ndarray
+            Nuisance alms array of shape (n_channels, (n_fields), n_alms).
+        nuis_case: Dict[str, Any]
+            Dictionary with nuisance covariance parameters.
+        nsim: Optional[Union[int, str]]
+            Simulation number identifier for covariance estimation.
+        **kwargs:
+            Additional keyword arguments for alm/map conversions.
+
+    Returns
+    -------
+        None
+    """
+
+    if nuis_alms.ndim == 3:
+        if nuis_alms.shape[1] == 3:
+            fields_ilc = ["T", "E", "B"]
+        elif nuis_alms.shape[1] == 2:
+            fields_ilc = ["E", "B"]
+    elif nuis_alms.ndim == 2:
+        if config.field_out in ["T", "E", "B"]:
+            fields_ilc = [config.field_out]
+        elif config.field_out in ["QU_E", "QU_B"]:
+            fields_ilc = [config.field_out[-1]]
+
+    if nuis_alms.ndim == 3:
+        for i in range(nuis_alms.shape[1]):
+            nuis_case["field"] = fields_ilc[i]
+            _nuiscov_scalar(config, nuis_alms[:, i], nuis_case, **kwargs)
+    elif nuis_alms.ndim == 2:
+        nuis_case["field"] = fields_ilc[0]
+        _nuiscov_scalar(config, nuis_alms, nuis_case, **kwargs)
+
+    del nuis_case["field"]
+
+
 def _fgd_diagnostic(config: Configs, input_alms: np.ndarray, compsep_run: Dict[str, Any]) -> np.ndarray:
     """
     Foreground diagnostic map generation.
@@ -482,6 +528,30 @@ def _gilc_scalar(config: Configs, input_alms: np.ndarray, compsep_run: Dict[str,
     else:
         raise ValueError(f"Unsupported domain: {compsep_run['domain']}")
 
+def _nuiscov_scalar(config: Configs, nuis_alms: np.ndarray, compsep_run: Dict[str, Any], **kwargs) -> None:
+    """
+    Compute and store nuisance covariance in pixel or needlet domain.
+
+    Parameters
+    ----------
+        config : Configs
+            Configuration object. See `compute_and_update_nuisance_covariance` for details.
+        nuis_alms : np.ndarray
+            Nuisance alm coefficients. Shape should be (n_channels, n_alms).
+        compsep_run : dict
+            Dictionary with parameters for nuisance covariance computation. See `compute_and_update_nuisance_covariance` for details.
+
+    Returns
+    -------
+        None
+    """
+    if compsep_run["domain"] == "pixel":
+        _nuiscov_pixel(config, nuis_alms, compsep_run, **kwargs)
+    elif compsep_run["domain"] == "needlet":
+        _nuiscov_needlet(config, nuis_alms, compsep_run, **kwargs)
+    else:
+        raise ValueError(f"Unsupported domain: {compsep_run['domain']}")
+
 
 def _fgd_diagnostic_scalar(config: Configs, input_alms: np.ndarray, compsep_run: Dict[str, Any]) -> np.ndarray:
     """
@@ -542,7 +612,8 @@ def _gilc_pixel(config: Configs, input_alms: np.ndarray, compsep_run: Dict[str, 
         np.ones(config.lmax + 1),
         depro_cmb=compsep_run["depro_cmb"],
         m_bias=compsep_run["m_bias"],
-        noise_debias=compsep_run["cov_noise_debias"]
+        noise_debias=compsep_run["cov_noise_debias"],
+        mask=compsep_run.get("mask", None)
     )
     
     del compsep_run['good_channels']
@@ -556,6 +627,40 @@ def _gilc_pixel(config: Configs, input_alms: np.ndarray, compsep_run: Dict[str, 
         output_maps[:,compsep_run["mask"] == 0.,:] = 0.
 
     return output_maps
+
+def _nuiscov_pixel(config: Configs, nuis_alms: np.ndarray, compsep_run: Dict[str, Any], **kwargs) -> None:
+    """
+    Nuisance covariance computation in pixel domain.
+
+    Parameters
+    ----------
+        config : Configs
+            Configuration object. See `compute_and_update_nuisance_covariance' for details.
+        nuis_alms : np.ndarray
+            Input spherical harmonic coefficients for nuisance. Shape should be (n_channels, n_alms).
+        compsep_run : dict
+            Settings for nuisance covariance computation. See `compute_and_update_nuisance_covariance` for details.
+        kwargs : dict
+            Extra keyword arguments passed to alm/map conversion routines.
+
+    """
+
+    compsep_run["good_channels"] = _get_good_channels_nl(config, np.ones(config.lmax+1))
+
+    input_maps = np.zeros((compsep_run["good_channels"].shape[0], 12 * config.nside**2))
+    for n, channel in enumerate(compsep_run["good_channels"]):
+        input_maps[n] = hp.alm2map(np.ascontiguousarray(nuis_alms[channel, :]), config.nside, lmax=config.lmax, pol=False)
+
+    _nuiscov(
+        config,
+        input_maps,
+        compsep_run,
+        np.ones(config.lmax + 1), mask=compsep_run.get("mask", None)
+    )
+    
+    del compsep_run['good_channels']
+
+    return None
 
 def _fgd_diagnostic_pixel(config: Configs, input_alms: np.ndarray, compsep_run: dict) -> np.ndarray:
     """
@@ -583,7 +688,7 @@ def _fgd_diagnostic_pixel(config: Configs, input_alms: np.ndarray, compsep_run: 
     for n, channel in enumerate(compsep_run["good_channels"]):
         input_maps[n] = np.array([hp.alm2map(np.ascontiguousarray(input_alms[channel, :, c]), config.nside, lmax=config.lmax, pol=False) for c in range(input_alms.shape[-1])]).T
 
-    output_maps = _get_diagnostic_maps(config, input_maps, compsep_run, np.ones(config.lmax+1), noise_debias=compsep_run["cov_noise_debias"])
+    output_maps = _get_diagnostic_maps(config, input_maps, compsep_run, np.ones(config.lmax+1), noise_debias=compsep_run["cov_noise_debias"], mask=compsep_run.get("mask", None))
 
     del compsep_run['good_channels']
 
@@ -632,11 +737,48 @@ def _gilc_needlet(config: Configs, input_alms: np.ndarray, compsep_run: dict, **
     output_maps = np.zeros((output_alms.shape[0], 12 * config.nside**2, output_alms.shape[-1]))
     for f, c in np.ndindex(output_alms.shape[0],output_alms.shape[-1]):
         output_maps[f,:,c] = hp.alm2map(np.ascontiguousarray(output_alms[f, :, c]), config.nside, lmax=config.lmax, pol=False, pixwin=config.pixel_window_out)
-    
+    del output_alms
+
     if "mask" in compsep_run:
         output_maps[:,compsep_run["mask"] == 0.,:] = 0.
 
     return output_maps
+
+def _nuiscov_needlet(config: Configs, nuis_alms: np.ndarray, compsep_run: dict, **kwargs) -> None:
+    """
+    Compute nuisance covariance in the needlet domain.
+
+    Parameters
+    ----------
+        config: Configs
+            Configuration object which includes general settings like nside and lmax. See `compute_and_update_nuisance_covariance` for details.
+        nuis_alms: np.ndarray
+            Input nuisance alms with shape (n_channels, n_alms).
+        compsep_run: dict
+            Parameters including needlet configuration for covariance computation. See `compute_and_update_nuisance_covariance` for details.
+        **kwargs: dict
+            Extra parameters for alm2map/map2alm.
+
+    Returns
+    ----------
+        None
+    """
+    b_ell = _get_needlet_windows_(compsep_run["needlet_config"], config.lmax)
+    if compsep_run["b_squared"]:
+        b_ell = b_ell**2
+
+    if compsep_run['save_needlets']:
+        compsep_run["path_out"] = _get_full_path_nuiscov(config, compsep_run)
+        os.makedirs(compsep_run["path_out"], exist_ok=True)
+        np.save(os.path.join(compsep_run["path_out"], "needlet_bands"), b_ell)
+        
+    for j in range(b_ell.shape[0]):
+        _nuiscov_needlet_j(
+            config, nuis_alms, compsep_run,
+            b_ell[j], j, **kwargs
+        )
+
+    return None
 
 def _fgd_diagnostic_needlet(config: Configs, input_alms: np.ndarray, compsep_run: dict) -> np.ndarray:
     """
@@ -710,10 +852,22 @@ def _gilc_needlet_j(config: Configs, input_alms: np.ndarray, compsep_run: dict,
             Output GNILC alms for the provided needlet band. Shape will be (n_channels_out, n_alms, n_components). 
     """
 
-    if "mask" in compsep_run or not compsep_run["adapt_nside"]:
-        nside_, lmax_ = config.nside, config.lmax
-    else:
+#    if "mask" in compsep_run or not compsep_run["adapt_nside"]:
+#        nside_, lmax_ = config.nside, config.lmax
+#    else:
+#        nside_, lmax_ = _get_nside_lmax_from_b_ell(b_ell,config.nside,config.lmax)
+    if compsep_run["adapt_nside"]:
         nside_, lmax_ = _get_nside_lmax_from_b_ell(b_ell,config.nside,config.lmax)
+    else:
+        nside_, lmax_ = config.nside, config.lmax
+
+    if "mask" in compsep_run:
+        if nside_ < config.nside:
+            mask = _downgrade_mask(compsep_run["mask"], nside_, threshold=0.)
+        else:
+            mask = compsep_run["mask"]
+    else:
+        mask = None
         
     compsep_run["good_channels"] = _get_good_channels_nl(config, b_ell)
 
@@ -726,9 +880,9 @@ def _gilc_needlet_j(config: Configs, input_alms: np.ndarray, compsep_run: dict,
         ]).T
 
     output_maps_nl = _gilc_maps(config, input_maps_nl, compsep_run, b_ell, depro_cmb=depro_cmb, 
-        m_bias=m_bias, noise_debias=noise_debias, nl_scale=nl_scale)
+        m_bias=m_bias, noise_debias=noise_debias, nl_scale=nl_scale, mask=mask)
 
-    del input_maps_nl
+    del input_maps_nl, mask
 
     output_alms_j = np.zeros((output_maps_nl.shape[0], hp.Alm.getsize(config.lmax), output_maps_nl.shape[-1]), dtype=complex)
     
@@ -743,8 +897,62 @@ def _gilc_needlet_j(config: Configs, input_alms: np.ndarray, compsep_run: dict,
             output_alms_j[n] = _needlet_filtering(output_alms_nl, b_ell[:lmax_+1], config.lmax)
 
     del compsep_run['good_channels']
+    del output_maps_nl
 
     return output_alms_j
+
+def _nuiscov_needlet_j(config: Configs, nuis_alms: np.ndarray, compsep_run: dict,
+                    b_ell: np.ndarray, nl_scale: int, **kwargs) -> None:
+    """
+    Perform nuisance covariance computation in a specific needlet band.
+
+    Parameters
+    ----------
+        config: Configs
+            Configuration object which includes general settings like nside, lmax, units. See `compute_and_update_nuisance_covariance` for details.
+        nuis_alms: np.ndarray
+            Input nuisance alms for the scalar fields. Shape should be (n_channels, n_alms).
+        compsep_run: dict
+            Dictionary with parameters for nuisance covariance computation. See `compute_and_update_nuisance_covariance` for details.
+        b_ell: np.ndarray
+            Needlet band window function for the current band. Shape should be (lmax+1,).
+        nl_scale : int
+            Needlet scale index corresponding to the current run. Used for saving nuisance covariance with proper label.
+        **kwargs: dict
+            Additional keyword arguments for healpy function map2alm.
+
+    Returns
+    -------
+        None
+    """
+
+#    if "mask" in compsep_run or not compsep_run["adapt_nside"]:
+#        nside_, lmax_ = config.nside, config.lmax
+#    else:
+#        nside_, lmax_ = _get_nside_lmax_from_b_ell(b_ell,config.nside,config.lmax)
+    if compsep_run["adapt_nside"]:
+        nside_, lmax_ = _get_nside_lmax_from_b_ell(b_ell,config.nside,config.lmax)
+    else:
+        nside_, lmax_ = config.nside, config.lmax   
+
+    if "mask" in compsep_run:
+        if nside_ < config.nside:
+            mask = _downgrade_mask(compsep_run["mask"], nside_, threshold=0.)
+        else:
+            mask = compsep_run["mask"]
+    else:
+        mask = None
+
+    compsep_run["good_channels"] = _get_good_channels_nl(config, b_ell)
+
+    input_maps_nl = np.zeros((compsep_run["good_channels"].shape[0], 12 * nside_**2))
+    for n, channel in enumerate(compsep_run["good_channels"]):
+        input_alms_j = _needlet_filtering(nuis_alms[channel], b_ell, lmax_)
+        input_maps_nl[n] = hp.alm2map(np.ascontiguousarray(input_alms_j), nside_, lmax=lmax_, pol=False)
+
+    _nuiscov(config, input_maps_nl, compsep_run, b_ell, nl_scale=nl_scale, mask=mask)
+
+    return None
 
 def _fgd_diagnostic_needlet_j(config: Configs, input_alms: np.ndarray,
                                compsep_run: dict, b_ell: np.ndarray, noise_debias: Optional[float] = 0.
@@ -772,10 +980,22 @@ def _fgd_diagnostic_needlet_j(config: Configs, input_alms: np.ndarray,
             Diagnostic map of foreground complexity for the provided needlet band.
 
     """
-    if "mask" in compsep_run or not compsep_run["adapt_nside"]:
-        nside_, lmax_ = config.nside, config.lmax
-    else:
+#    if "mask" in compsep_run or not compsep_run["adapt_nside"]:
+#        nside_, lmax_ = config.nside, config.lmax
+#    else:
+#        nside_, lmax_ = _get_nside_lmax_from_b_ell(b_ell,config.nside,config.lmax)
+    if compsep_run["adapt_nside"]:
         nside_, lmax_ = _get_nside_lmax_from_b_ell(b_ell,config.nside,config.lmax)
+    else:
+        nside_, lmax_ = config.nside, config.lmax   
+
+    if "mask" in compsep_run:
+        if nside_ < config.nside:
+            mask = _downgrade_mask(compsep_run["mask"], nside_, threshold=0.)
+        else:
+            mask = compsep_run["mask"]
+    else:
+        mask = None
         
     compsep_run["good_channels"] = _get_good_channels_nl(config, b_ell)
 #    compsep_run["good_channels"] = np.arange(input_alms.shape[0])
@@ -788,7 +1008,7 @@ def _fgd_diagnostic_needlet_j(config: Configs, input_alms: np.ndarray,
             for c in range(input_alms.shape[-1])
         ]).T
 
-    output_maps_nl = _get_diagnostic_maps(config, input_maps_nl, compsep_run, b_ell, noise_debias=noise_debias)
+    output_maps_nl = _get_diagnostic_maps(config, input_maps_nl, compsep_run, b_ell, noise_debias=noise_debias, mask=mask)
     del input_maps_nl
     
     if hp.get_nside(output_maps_nl) < config.nside:
@@ -807,6 +1027,7 @@ def _gilc_maps(
     m_bias: Union[int, float] = 0,
     noise_debias: Optional[float] = 0.,
     nl_scale: Optional[Union[int, None]] = None,
+    mask: Optional[np.ndarray] = None,
 ) -> np.ndarray:
     """
     Apply GILC component separation to the provided scalar multifrequency maps.
@@ -831,6 +1052,9 @@ def _gilc_maps(
             noise covariance from the input and nuisance covariance matrices.
         nl_scale : int, optional
             Needlet scale index corresponding to the current GILC run. Used for saving weights with proper label.
+        mask: np.ndarray, optional
+            Optional mask to be applied to the input maps. Shape should be (npix,).
+            If non-binary, it will be applied as a weight during covariance computation.
     
     Returns
     -------
@@ -839,28 +1063,56 @@ def _gilc_maps(
     
     """
     # Compute covariance matrices for input and nuisance maps
-    cov = (get_ilc_cov(input_maps[...,0], config.lmax, compsep_run, b_ell)).T
-    if isinstance(compsep_run["nuis_idx"], int):
-        cov_n = (get_ilc_cov(input_maps[...,compsep_run["nuis_idx"]], config.lmax, compsep_run, b_ell)).T
-    elif isinstance(compsep_run["nuis_idx"], list):
-        cov_n = (get_ilc_cov(input_maps[...,compsep_run["nuis_idx"][0]] + input_maps[...,compsep_run["nuis_idx"][1]], config.lmax, compsep_run, b_ell)).T
+    cov = (get_ilc_cov(input_maps[...,0], config.lmax, compsep_run, b_ell, mask=mask)).T
+    if compsep_run["ilc_bias"] != 0. and mask is not None:
+        mask_cov = (cov[:,0,0] != 0.).astype(float)
+        if np.sum(mask_cov == 0.) == mask_cov.shape[0]:
+            raise ValueError("The provided mask masks out all the pixels used for covariance computation.")
+        elif np.sum(mask_cov == 0.) == 0:
+            mask_cov = None
+    else:
+        mask_cov = None
+    
+    if not ("load_nuisance_covariance" in compsep_run and compsep_run["load_nuisance_covariance"]):
+        if isinstance(compsep_run["nuis_idx"], int):
+            cov_n = (get_ilc_cov(input_maps[...,compsep_run["nuis_idx"]], config.lmax, compsep_run, b_ell, mask=mask)).T
+        elif isinstance(compsep_run["nuis_idx"], list):
+            cov_n = (get_ilc_cov(input_maps[...,compsep_run["nuis_idx"][0]] + input_maps[...,compsep_run["nuis_idx"][1]], config.lmax, compsep_run, b_ell, mask=mask)).T
+    else:
+        path_nuiscov = _get_full_path_nuiscov(config, compsep_run)
+        cov_n = load_nuiscov(config, path_nuiscov, compsep_run,
+                            hp.npix2nside(input_maps.shape[-2]), nl_scale=nl_scale, include_noise=True, include_cmb=compsep_run["cmb_nuisance"])
 
     if noise_debias != 0.:
-        cov_noi = (get_ilc_cov(input_maps[...,compsep_run["noise_idx"]], config.lmax, compsep_run, b_ell)).T
+        if not ("load_noise_covariance" in compsep_run and compsep_run["load_noise_covariance"]):
+            cov_noi = (get_ilc_cov(input_maps[...,compsep_run["noise_idx"]], config.lmax, compsep_run, b_ell, mask=mask)).T
+        else:
+            path_nuiscov = _get_full_path_nuiscov(config, compsep_run)
+            cov_noi = load_nuiscov(config, path_nuiscov, compsep_run,
+                                hp.npix2nside(input_maps.shape[-2]), nl_scale=nl_scale, include_noise=True, include_cmb=False)
+
         cov = cov - noise_debias * cov_noi
         cov_n = cov_n - noise_debias * cov_noi
         del cov_noi
 
-    λ, U = Cn_C_Cn(cov,cov_n)
+    if mask_cov is not None:
+        λ, U = Cn_C_Cn(cov[mask_cov != 0.],cov_n[mask_cov != 0.])
+    else:
+        λ, U = Cn_C_Cn(cov,cov_n)
+
     λ[λ<1.]=1.
 
-    W = _get_gilc_weights(config, U, λ, cov, cov_n, input_maps.shape, compsep_run, depro_cmb=depro_cmb, m_bias=m_bias) 
+    W = _get_gilc_weights(config, U, λ, cov, cov_n, input_maps.shape, compsep_run, depro_cmb=depro_cmb, m_bias=m_bias, mask_cov=mask_cov)
+    del mask_cov, U, λ
+    if compsep_run["ilc_bias"] != 0. and mask is not None:
+        W[mask == 0.,...] = 0.
+
     if compsep_run["save_weights"]:
         compsep_run["path_out"] = _get_full_path_out(config, compsep_run)
         save_ilc_weights(config, W, compsep_run,
                          hp.npix2nside(input_maps.shape[-2]), nl_scale=nl_scale)
 
-    del cov, cov_n, U, λ
+    del cov, cov_n
 
     if compsep_run["ilc_bias"] == 0.:
         output_maps = np.einsum('li,ijk->ljk', W, input_maps)
@@ -877,12 +1129,54 @@ def _gilc_maps(
 
     return np.array(outputs)
 
+def _nuiscov(
+    config: Configs,
+    input_maps: np.ndarray,
+    compsep_run: Dict[str, Any],
+    b_ell: np.ndarray,
+    nl_scale: Optional[Union[int, None]] = None,
+    mask: Optional[np.ndarray] = None,
+) -> None:
+    """
+    Compute nuisance covariance for the provided scalar multifrequency maps.
+    
+    Parameters
+    ----------
+        config: Configs
+            Configuration object which includes general settings like nside and lmax. See `compute_and_update_nuisance_covariance` for details.
+        input_maps: np.ndarray
+            Input nuisance maps for the scalar fields. Shape should be (n_channels, npix).
+        compsep_run: Dict[str, Any]
+            Dictionary with settings for nuisance covariance computation. See `compute_and_update_nuisance_covariance` for details.
+        b_ell: np.ndarray
+            Needlet band window function for the current band. Shape should be (lmax+1,).
+        nl_scale : int, optional
+            Needlet scale index corresponding to the provided input maps. Used for saving covariance with proper label.
+        mask: np.ndarray, optional
+            Optional mask to be applied to the input maps. Shape should be (npix,).
+            If non-binary, it will be applied as a weight during covariance computation.
+    
+    Returns
+    -------
+        None
+    
+    """
+    # Compute covariance matrices for input and nuisance maps
+    cov_n = (get_ilc_cov(input_maps, config.lmax, compsep_run, b_ell, mask=mask)).T
+    
+    compsep_run["path_out"] = _get_full_path_nuiscov(config, compsep_run)
+    update_and_save_nuiscov_serial(config, cov_n, compsep_run,
+                        hp.npix2nside(input_maps.shape[-1]), nl_scale=nl_scale)
+
+    return None
+
 def _get_diagnostic_maps(
     config: Configs,
     input_maps: np.ndarray,
     compsep_run: dict,
     b_ell: np.ndarray,
     noise_debias: Optional[float] = 0.,
+    mask: Optional[np.ndarray] = None,
 ) -> np.ndarray:
     """
     Get diagnostic maps of foreground complexity for provided scalar field either in pixel or needlet domain.
@@ -900,6 +1194,9 @@ def _get_diagnostic_maps(
         noise_debias: float, optional
             Noise debiasing factor. If set to a non-zero value, it will subtract a 'noise_debias' fraction of
             noise covariance from the input and nuisance covariance matrices.
+        mask: np.ndarray, optional
+            Optional mask to be applied to the input maps. Shape should be (npix,).
+            If non-binary, it will be applied as a weight during covariance computation.
     
     Returns
     -------
@@ -908,16 +1205,38 @@ def _get_diagnostic_maps(
 
     """
 
-    cov = (get_ilc_cov(input_maps[...,0], config.lmax, compsep_run, b_ell)).T
-    cov_n = (get_ilc_cov(input_maps[...,1], config.lmax, compsep_run, b_ell)).T
-    
+    cov = (get_ilc_cov(input_maps[...,0], config.lmax, compsep_run, b_ell, mask=mask)).T
+    if compsep_run["ilc_bias"] != 0. and mask is not None:
+        mask_cov = (cov[:,0,0] != 0.).astype(float)
+        if np.sum(mask_cov == 0.) == mask_cov.shape[0]:
+            raise ValueError("The provided mask masks out all the pixels used for covariance computation.")
+        elif np.sum(mask_cov == 0.) == 0:
+            mask_cov = None
+    else:
+        mask_cov = None
+
+    if not ("load_nuisance_covariance" in compsep_run and compsep_run["load_nuisance_covariance"]):
+        cov_n = (get_ilc_cov(input_maps[...,compsep_run["nuis_idx"]], config.lmax, compsep_run, b_ell, mask=mask)).T
+    else:
+        path_nuiscov = _get_full_path_nuiscov(config, compsep_run)
+        cov_n = load_nuiscov(config, path_nuiscov, compsep_run,
+                            hp.npix2nside(input_maps.shape[-2]), nl_scale=nl_scale, include_noise=True, include_cmb=compsep_run["cmb_nuisance"])
+
     if noise_debias != 0.:
-        cov_noi = (get_ilc_cov(input_maps[...,2], config.lmax, compsep_run, b_ell)).T
+        if not ("load_noise_covariance" in compsep_run and compsep_run["load_noise_covariance"]):
+            cov_noi = (get_ilc_cov(input_maps[...,compsep_run["noise_idx"]], config.lmax, compsep_run, b_ell, mask=mask)).T
+        else:
+            path_nuiscov = _get_full_path_nuiscov(config, compsep_run)
+            cov_noi = load_nuiscov(config, path_nuiscov, compsep_run,
+                            hp.npix2nside(input_maps.shape[-2]), nl_scale=nl_scale, include_noise=True, include_cmb=False)
         cov = cov - noise_debias * cov_noi
         cov_n = cov_n - noise_debias * cov_noi
         del cov_noi
 
-    λ, U = Cn_C_Cn(cov,cov_n)
+    if mask_cov is not None:
+        λ, U = Cn_C_Cn(cov[mask_cov != 0.],cov_n[mask_cov != 0.])
+    else:
+        λ, U = Cn_C_Cn(cov,cov_n)
     λ[λ<1.]=1.
     del cov, cov_n, U
 
@@ -925,13 +1244,26 @@ def _get_diagnostic_maps(
 
     if isinstance(m, (int, float)):
         m = np.repeat(m, input_maps.shape[-2])
-        if "mask" in compsep_run:
-            m[compsep_run["mask"] == 0.] = 0.
+#        if "mask" in compsep_run:
+#            m[compsep_run["mask"] == 0.] = 0.
+        if mask is not None:
+            m[mask == 0.] = 0.
         return m
     else:
-        if "mask" in compsep_run:
-            m_full = np.zeros(input_maps.shape[-2])
-            m_full[compsep_run["mask"] > 0.] = m
+#        if "mask" in compsep_run:
+#            m_full = np.zeros(input_maps.shape[-2])
+#            m_full[compsep_run["mask"] > 0.] = m
+#            return m_full
+        if mask is not None:
+            if mask_cov is None:
+                m_full = hp.upgrade(m, nside_out=npix2nside(input_maps.shape[-2]))
+                m_full[mask == 0.] = 0.
+            else:
+                m_ = np.zeros(mask_cov.shape[0])
+                m_[mask_cov != 0.] = m
+                del m
+                m_full = hp.ud_grade(m_, nside_out=npix2nside(input_maps.shape[-2]))
+                m_full[mask == 0.] = 0.
             return m_full
         else:
             return m
@@ -945,7 +1277,8 @@ def _get_gilc_weights(
     input_shapes: tuple,
     compsep_run: dict,
     depro_cmb: Optional[float] = None,
-    m_bias: Union[int, float] = 0
+    m_bias: Union[int, float] = 0,
+    mask_cov: Optional[np.ndarray] = None,
 ) -> np.ndarray:
     """
     Get GILC weights for the provided scalar field.
@@ -971,6 +1304,8 @@ def _get_gilc_weights(
             Residual CMB in GNILC maps will be at the level of depro_CMB * CMB_input.
         m_bias: int, optional
             It will include m_bias more (if m_bias > 0) or less (if m_bias < 0) modes in the reconstructed GNILC maps.
+        mask_cov: np.ndarray, optional
+            Optional mask applied during covariance computation. Shape should be (npix,).
     
     Returns
     -------
@@ -1003,9 +1338,11 @@ def _get_gilc_weights(
     elif cov.ndim == 3:
         m = _get_gilc_m(λ)
         m += int(m_bias)  
+        del λ
 
         covn_sqrt = lg.cholesky(cov_n)
 #        covn_sqrt_inv = lg.inv(covn_sqrt)
+        del cov_n
         
         W_=np.zeros((cov.shape[0],input_shapes[0],input_shapes[0]))
 
@@ -1036,9 +1373,20 @@ def _get_gilc_weights(
 
         del covn_sqrt, cov_inv, U_s, F, m
 
-        if "mask" in compsep_run:
-            W = np.zeros((input_shapes[1],W_.shape[1],W_.shape[2]))
-            W[compsep_run["mask"] > 0.] = np.copy(W_)
+#        if "mask" in compsep_run:
+#            W = np.zeros((input_shapes[1],W_.shape[1],W_.shape[2]))
+#            W[compsep_run["mask"] > 0.] = np.copy(W_)
+        if mask_cov is not None:
+            W__ = np.zeros((mask_cov.shape[0],W_.shape[1],W_.shape[2]))
+            W__[mask_cov != 0.] = np.copy(W_)
+            del W_
+            if W__.shape[0] != input_shapes[1]:
+                W = np.zeros((input_shapes[1],W__.shape[1],W__.shape[2]))
+                for i, k in np.ndindex(W__.shape[1],W__.shape[2]):
+                    W[:,i,k]=hp.ud_grade(W__[:,i,k],hp.npix2nside(input_shapes[1]))
+            else:
+                W=np.copy(W__)
+            del W__
         else:
             if W_.shape[0] != input_shapes[1]:
                 W = np.zeros((input_shapes[1],W_.shape[1],W_.shape[2]))
@@ -1046,7 +1394,7 @@ def _get_gilc_weights(
                     W[:,i,k]=hp.ud_grade(W_[:,i,k],hp.npix2nside(input_shapes[1]))
             else:
                 W=np.copy(W_)
-        del W_
+            del W_
 
     return W
 

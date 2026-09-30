@@ -5,12 +5,12 @@ from .routines import _slice_data, _map2alm_kwargs, _log
 from .needlets import _get_needlet_windows_,  _needlet_filtering
 from .configurations import Configs
 from types import SimpleNamespace
-from .simulations import _get_data_foregrounds_, _get_data_simulations_
+from .simulations import _get_foregrounds_, _get_input_data
 from typing import Optional, Union, List, Dict, Any, Tuple
 import sys
 
 
-def get_and_save_real_tracers_B(
+def get_mcilc_tracers(
     config: Configs,
     foregrounds: Optional[np.ndarray] = None,
     systematics: Optional[np.ndarray] = None,
@@ -112,19 +112,20 @@ def get_and_save_real_tracers_B(
 
     tracers = component_separation(config_mc, mc_data)
     
-    tracers = _combine_B_tracers(np.array(tracers.total))
+    tracers = _combine_tracers(np.array(tracers.total))
 
     _log(f"Saving the tracers in {config.real_mc_tracers[0]['path_tracers']} directory", verbose=config_mc.verbose)
 
-    _save_real_tracers_B(
+    _save_real_tracers(
         tracers,
         config.real_mc_tracers[0]["path_tracers"],
         np.array(config_mc.instrument.channels_tags)[config.real_mc_tracers[0]["channels_tracers"]],
         config_mc.fwhm_out,
-        config_mc.lmax
+        config_mc.lmax,
+        config_mc.field_out
     )
 
-def _save_real_tracers_B(tracers, path_tracers, tags, fwhm_out, lmax):
+def _save_real_tracers(tracers, path_tracers, tags, fwhm_out, lmax, field_out: str = "B") -> None:
     """
     Save the generated realistic B-mode tracers in the specified path.
 
@@ -140,11 +141,13 @@ def _save_real_tracers_B(tracers, path_tracers, tags, fwhm_out, lmax):
             Full width at half maximum of the output beam in arcminutes associated to the tracers.
         lmax : int
             Maximum multipole for the tracers.
+        field_out : str, optional
+            Field of the tracers to be saved. Default is "B".
     
     Returns
     -------
         None
-            Saves the tracers in the specified path with the format "B_tracer_{tag}_{fwhm_out}acm_ns{nside}_lmax{lmax}.fits"
+            Saves the tracers in the specified path with the format "{field_out}_tracer_{tag}_{fwhm_out}acm_ns{nside}_lmax{lmax}.fits"
 
     """
 
@@ -155,7 +158,8 @@ def _save_real_tracers_B(tracers, path_tracers, tags, fwhm_out, lmax):
         path_tracers = path_tracers + '/'
 
     for i, tracer in enumerate(tracers):
-        hp.write_map(path_tracers + f"B_tracer_{tags[i]}_{fwhm_out}acm_ns{hp.npix2nside(tracer.shape[0])}_lmax{lmax}.fits", tracer, overwrite=True)
+        hp.write_map(path_tracers + f"{field_out}_tracer_{tags[i]}_{fwhm_out}acm_ns{hp.npix2nside(tracer.shape[0])}_lmax{lmax}.fits", tracer, overwrite=True)
+        print('tracer_saved')
     
 def initialize_scalar_tracers(
     config: Configs,
@@ -248,9 +252,10 @@ def get_tracers_paths_for_ratio(
         f"{path_tracers}{field}_tracer_{tag}_{config.fwhm_out}acm_ns{config.nside}_lmax{config.lmax}.fits"
         for tag in tracers_tags
     ]
+    print(tracers_paths)
 
     missing_tracers = [tracers_tags[n] for n, path in enumerate(tracers_paths) if not os.path.exists(path)]
-
+    print(missing_tracers)
     if missing_tracers:
         raise ValueError(f"Missing tracer files: {missing_tracers}. Please check the paths or run the tracer generation routine.")
 
@@ -562,7 +567,7 @@ def get_mc_config(config: Configs, tracers_inputs_path: str) -> Configs:
     ----------
     config : Configs
             Configuration object containing the instrumental and parameters configuration. 
-            See 'generate_and_save_real_tracers_B' for details.
+            See 'generate_and_save_real_tracers' for details.
         tracers_inputs_path : str
             Path where the MC-ILC tracers inputs are stored. It should be a directory path.
 
@@ -660,19 +665,19 @@ def get_mc_data(
     """
 
     if foregrounds is None:
-        mc_foregrounds = _get_data_foregrounds_(config_mc)
+        mc_foregrounds = _get_foregrounds_(config_mc)
     else:
         mc_foregrounds = SimpleNamespace()
         mc_foregrounds.total = foregrounds
 
-    mc_data = _get_data_simulations_(config_mc, mc_foregrounds)
+    mc_data = _get_input_data(config_mc, foregrounds = mc_foregrounds)
 
     if systematics is not None:
         mc_data.total = mc_data.total + systematics
 
     return _slice_data(mc_data, config_mc.mc_data_field, config_mc.field_in)
 
-def _combine_B_tracers(tracers, coefficients=[0.7,0.3]):
+def _combine_tracers(tracers, coefficients=[0.7,0.3]):
     """
     Combine the scalar tracers using the provided coefficients.
 

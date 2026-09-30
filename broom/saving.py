@@ -3,7 +3,7 @@ import re
 import numpy as np
 import healpy as hp
 from typing import Any, Optional, Union, Dict
-from .routines import _log
+from .routines import _log, _format_nsim
 from .configurations import Configs
 from types import SimpleNamespace
 import fnmatch
@@ -153,7 +153,7 @@ def _save_residuals_template(
     config: Configs,
     output_maps: SimpleNamespace,
     compsep_run: Dict[str, Any],
-    nsim: Optional[str] = None
+    nsim: Optional[str] = None,
 ) -> None:
     """
     Save residual foreground templates.
@@ -178,9 +178,9 @@ def _save_residuals_template(
     """
     path_out = os.path.join(config.path_outputs, compsep_run["compsep_path"])
 
-    gnilc_run = (re.search(r'(gilc_[^/]+)', compsep_run["gnilc_path"])).group(1)
+    gnilc_run = (re.search(r'(gilc_[^/]+)', compsep_run["gilc_path"])).group(1)
     if "needlet" in gnilc_run:
-        folder_after = (compsep_run["gnilc_path"]).split(gnilc_run + "/")[1].split("/")[0]
+        folder_after = (compsep_run["gilc_path"]).split(gnilc_run + "/")[1].split("/")[0]
         gnilc_run += f"_{folder_after}"
 
     for attr_name, attr_values in vars(output_maps).items():
@@ -198,11 +198,84 @@ def _save_residuals_template(
             f"{config.field_out}_{label_out}_{config.fwhm_out}acm_"
             f"ns{config.nside}_lmax{config.lmax}"
         )
+        if compsep_run["nsim_weights"] is not None and nsim != compsep_run["nsim_weights"]:
+            filename += f"_w{compsep_run['nsim_weights']}"
         if nsim is not None:
             filename += f"_{nsim}"
         filename += ".fits"
 
         hp.write_map(os.path.join(path_c, filename), attr_values, overwrite=True)
+
+def _save_combination(
+    config: Configs,
+    output_maps: SimpleNamespace,
+    compsep_run: Dict[str, Any],
+    nsim: Optional[str] = None,
+) -> None:
+    """
+    Save output maps from combination of input data with component separation weights.
+
+    Parameters
+    -----------
+        config: Configs
+            Configuration object. It contains paths and parameters for saving outputs.
+        output_maps: SimpleNamespace
+            Object containing separated map outputs as attributes.
+        compsep_run: Dict
+            Dictionary describing the component separation method and setup.
+        nsim: str, optional
+            Simulation index for saving multiple realizations.
+
+    Returns
+    -----------
+        None
+            It saves the output maps from combination to disk in the specified directory structure
+            based on the component separation method and configuration.
+    
+    """
+    path_out = os.path.join(config.path_outputs, compsep_run["compsep_path"])
+
+    for attr_name, attr_values in vars(output_maps).items():
+        label_out = f"propagated_{attr_name}"
+
+        if "extra_info" in compsep_run:
+            path_c = os.path.join(path_out, f"{label_out}_{compsep_run['extra_info']}")
+        else:
+            path_c = os.path.join(path_out, f"{label_out}")
+        
+        if compsep_run["method"] == "gilc":
+            if nsim is not None:
+                path_c = os.path.join(path_c, f"{nsim}")
+
+        os.makedirs(path_c, exist_ok=True)
+
+        if compsep_run["method"] == "ilc":
+            filename = (
+                f"{config.field_out}_{label_out}_{config.fwhm_out}acm_"
+                f"ns{config.nside}_lmax{config.lmax}"
+            )
+            if compsep_run["nsim_weights"] is not None and nsim != compsep_run["nsim_weights"]:
+                filename += f"_w{compsep_run['nsim_weights']}"
+            if nsim is not None:
+                filename += f"_{nsim}"
+            filename += ".fits"
+
+            hp.write_map(os.path.join(path_c, filename), attr_values, overwrite=True)
+        else:
+            for f, freq in enumerate(compsep_run["channels_out"]):
+                tag = config.instrument.channels_tags[freq]
+                filename = (
+                    f"{config.field_out}_{label_out}_{tag}_{config.fwhm_out}acm_"
+                    f"ns{config.nside}_lmax{config.lmax}"
+                )
+                if compsep_run["nsim_weights"] is not None and nsim != compsep_run["nsim_weights"]:
+                    filename += f"_w{compsep_run['nsim_weights']}"
+                if nsim is not None:
+                    filename += f"_{nsim}"
+                filename += ".fits"
+
+                hp.write_map(os.path.join(path_c, filename), attr_values[f], overwrite=True)
+
 
 def _get_full_path_out(config: Configs, compsep_run: Dict[str, Any]) -> str:
     """
@@ -374,10 +447,57 @@ def _get_full_path_out(config: Configs, compsep_run: Dict[str, Any]) -> str:
 
     return path_out
 
-def get_gnilc_maps(
+def _get_full_path_nuiscov(config: Configs, compsep_run: Dict[str, Any]) -> str:
+    """
+    Constructs the full output path for saving nuisance covariance matrices based on configuration and run options.
+    Parameters
+    -----------
+        config: Configs
+            Configuration object.
+        compsep_run: dict
+            Dictionary containing method and domain setup.
+
+    Returns
+    --------
+        str
+            Full path where output nuisance covariance matrices should be saved.
+    """
+    
+    complete_path = f'nuisance_covariances_{compsep_run["domain"]}_bias{compsep_run["ilc_bias"]}'
+
+    if (config.leakage_correction is not None) and ("QU" in config.field_in) and (config.mask_observations is not None):
+        leak_def = (config.leakage_correction).split("_")[0] + (config.leakage_correction).split("_")[1] 
+        if "_recycling" in config.leakage_correction:
+            if "_iterations" in config.leakage_correction:
+                iterations = int(re.search(r'iterations(\d+)', config.leakage_correction).group(1))
+                leak_def += f'_iters{iterations}'
+        complete_path += f"_{leak_def}"
+
+    if compsep_run["domain"] == "needlet":
+        text_ = f"{compsep_run['needlet_config']['needlet_windows']}"
+        if compsep_run["needlet_config"]["needlet_windows"] != "cosine":
+            text_ += f'_B{compsep_run["needlet_config"]["width"]}'
+            if compsep_run["needlet_config"]["merging_needlets"]:
+                merging_needlets = compsep_run["needlet_config"]["merging_needlets"]
+                if merging_needlets[0] != 0:
+                    merging_needlets.insert(0,0)
+                for j_low, j_high in zip(merging_needlets[:-1], merging_needlets[1:]):
+                    text_ += f"_j{j_low}j{j_high-1}"
+        else:
+            for bandpeak in compsep_run["needlet_config"]["ell_peaks"]:
+                text_ += f"_{bandpeak}"
+        if compsep_run["b_squared"]:
+            text_ += "_nlsquared"
+        complete_path = os.path.join(complete_path, text_)
+
+    path_out = os.path.join(config.path_outputs, complete_path)
+
+    return path_out
+
+
+def get_gilc_maps(
     config: Configs,
-    path_gnilc: str,
-    field_in: Optional[str] = None,
+    gilc_config: Dict[str, Any],
     nsim: Optional[str] = None
 ) -> SimpleNamespace:
     """
@@ -388,89 +508,74 @@ def get_gnilc_maps(
     -----------
         config : Configs
             Configuration object containing instrument and output specifications.
-        path_gnilc : str
-            Root path to the GNILC output directory. The full path will be given by '{config.path_outputs}/{path_gnilc}'.
-        field_in : Optional[str], default=None
-            Type of field to load ("T", "QU", "EB", "TQU", "TEB", etc.). If None, default is config.field_out.
+        gilc_config : Dict[str, Any]
+            Dictionary containing GNILC configuration parameters, including:
+                path_gilc : str
+                    Root path to the GNILC output directory. The full path will be given by '{config.path_outputs}/{path_gilc}'.
+                gilc_components : List[str]
+                    List of GNILC components to load. Possible elements are "output_total", "noise_residuals", "fgds_residuals".
+                field_in : Optional[str], default=None
+                    Type of field to load ("T", "QU", "EB", "TQU", "TEB", etc.). If None, default is config.field_out.
         nsim : Optional[Union[str, int]], default=None
             Simulation identifier, if any (used to select specific simulation output files).
 
     Returns
     --------
         gnilc_maps : SimpleNamespace
-            A container with the following attributes:
-            - total: np.ndarray of GNILC total signal maps.
-            - noise: np.ndarray of noise residual maps (if available).
-            - fgds: np.ndarray of foreground residual maps (if available).
+            A container of numpy arrays with attributes corresponding to the requested GNILC components:
     """
-    if not os.path.exists(os.path.join(config.path_outputs, path_gnilc)):
-        raise ValueError(f"Path {os.path.join(config.path_outputs, path_gnilc)} does not exist.")
+    path_gilc = gilc_config["gilc_path"]
+    gilc_components = gilc_config["gilc_components"]
+    nside = gilc_config["nside"]
+    fwhm_out = gilc_config["fwhm_out"]
+    lmax = gilc_config["lmax"]
+    field_in = gilc_config["field_in"]
+
+    if not os.path.exists(os.path.join(config.path_outputs, path_gilc)):
+        raise ValueError(f"Path {os.path.join(config.path_outputs, path_gilc)} does not exist.")
     if field_in is None:
         field_in = config.field_out
     
-    gnilc_maps = SimpleNamespace()
+    gilc_maps = SimpleNamespace()
 
     if field_in in ["TQU", "TEB"]:
         if config.field_out == "T":
-            gnilc_fields = 0
+            gilc_fields = 0
         elif config.field_out in ["QU", "QU_E", "QU_B", "E", "B"]:
-            gnilc_fields = (1,2)
+            gilc_fields = (1,2)
         elif config.field_out in ["TQU","TEB"]:
-            gnilc_fields = (0,1,2)
+            gilc_fields = (0,1,2)
     elif field_in in ["QU","EB"]:
-        gnilc_fields = (0,1)
+        gilc_fields = (0,1)
     elif field_in in ["T","E","B"]:
-        gnilc_fields = 0
+        gilc_fields = 0
 
-    filepath = os.path.join(config.path_outputs, path_gnilc, "output_total")
-    if nsim is not None:
-        filepath = os.path.join(filepath, nsim)
-    if not os.path.exists(filepath):
-        raise ValueError(f"Path {filepath} does not contain the expected multifrequency maps.")
+    for component in gilc_components:
+        if component.split("_")[-1] == "residuals":
+            attr_out = component.split("_residuals")[0]
+        elif component == "output_total":
+            attr_out = "total"
+        elif component == "output_cmb":
+            attr_out = "cmb"
 
-    setattr(gnilc_maps, "total", [])
-
-    for f, freq in enumerate(config.instrument.frequency):
-        tag = config.instrument.channels_tags[f]
-        filename = f"{field_in}_output_total_{tag}_{config.fwhm_out}acm_ns{config.nside}_lmax{config.lmax}"
+        filepath = os.path.join(config.path_outputs, path_gilc, component)
         if nsim is not None:
-            filename += f"_{nsim}"
-        filename += ".fits"
-        getattr(gnilc_maps, "total").append(hp.read_map(os.path.join(filepath, filename), field=gnilc_fields))
-    setattr(gnilc_maps, "total", np.array(getattr(gnilc_maps, "total")))
+            filepath = os.path.join(filepath, nsim)
+        if not os.path.exists(filepath):
+            raise ValueError(f"Path {filepath} does not contain the expected GNILC {component} maps.")
 
-    filepath = os.path.join(config.path_outputs, path_gnilc, "noise_residuals")
-    if nsim is not None:
-        filepath = os.path.join(filepath, nsim)
-    if not os.path.exists(filepath):
-        print(f"Warning: Path {filepath} does not contain the expected noise residuals. Noise debias will not be possible")
-    else:
-        setattr(gnilc_maps, "noise", [])
+        setattr(gilc_maps, attr_out, [])
+
         for f, freq in enumerate(config.instrument.frequency):
             tag = config.instrument.channels_tags[f]
-            filename = f"{field_in}_noise_residuals_{tag}_{config.fwhm_out}acm_ns{config.nside}_lmax{config.lmax}"
+            filename = f"{field_in}_{component}_{tag}_{fwhm_out}acm_ns{nside}_lmax{lmax}"
             if nsim is not None:
                 filename += f"_{nsim}"
             filename += ".fits"
-            getattr(gnilc_maps, "noise").append(hp.read_map(os.path.join(filepath, filename), field=gnilc_fields))
-        setattr(gnilc_maps, "noise", np.array(getattr(gnilc_maps, "noise")))
+            getattr(gilc_maps, attr_out).append(hp.read_map(os.path.join(filepath, filename), field=gilc_fields))
+        setattr(gilc_maps, attr_out, np.array(getattr(gilc_maps, attr_out)))
 
-    filepath = os.path.join(config.path_outputs, path_gnilc, "fgds_residuals")
-    if nsim is not None:
-        filepath = os.path.join(filepath, nsim)
-    if os.path.exists(filepath):
-        _log(f"Path {filepath} contains the expected foregrounds residuals. The ideal template of foregrounds residuals with no CMB and noise contamination will be computed", verbose=config.verbose)
-        setattr(gnilc_maps, "fgds", [])
-        for f, freq in enumerate(config.instrument.frequency):
-            tag = config.instrument.channels_tags[f]
-            filename = f"{field_in}_fgds_residuals_{tag}_{config.fwhm_out}acm_ns{config.nside}_lmax{config.lmax}"
-            if nsim is not None:
-                filename += f"_{nsim}"
-            filename += ".fits"
-            getattr(gnilc_maps, "fgds").append(hp.read_map(os.path.join(filepath, filename), field=gnilc_fields))
-        setattr(gnilc_maps, "fgds", np.array(getattr(gnilc_maps, "fgds")))
-
-    return gnilc_maps
+    return gilc_maps
 
 def save_ilc_weights(
     config: Configs,
@@ -510,6 +615,148 @@ def save_ilc_weights(
         filename += f"_{compsep_run['nsim']}"
     np.save(filename, w)
 
+def update_and_save_nuiscov_serial(
+    config: Configs,
+    cov_n: np.ndarray,
+    compsep_run: Dict,
+    nside_: int,
+    nl_scale: Optional[Union[int, None]] = None
+) -> None:
+    """
+    Load, update, and save nuisance covariance matrices to disk with appropriate metadata in filename.
+
+    Parameters
+    ----------
+        config : Configs
+            Configuration object.
+        cov_n : np.ndarray
+            Nuisance covariance matrix to be added to the average covariance.
+        compsep_run : dict
+            Dictionary with parameters for nuisance covariance computation.
+        nside_ : int
+            HEALPix NSIDE resolution of the nuisance covariance.
+        nl_scale : int, optional
+            Needlet scale index associated with the nuisance covariance.
+    
+    Returns
+    -------
+        None
+            It loads, updates, and saves the nuisance covariance matrices to disk in the specified directory structure
+    """
+    path_cov = compsep_run["path_out"]
+    os.makedirs(path_cov, exist_ok=True)
+        
+    if compsep_run["include_cmb"] and compsep_run["include_noise"]:
+        filename = "cmb+noise"
+    elif compsep_run["include_cmb"] and not compsep_run["include_noise"]:
+        filename = "cmb"
+    elif not compsep_run["include_cmb"] and compsep_run["include_noise"]:
+        filename = "noise"
+    else:
+        raise ValueError("At least one of include_cmb or include_noise must be True for saving nuisance covariance.")
+
+    filename = os.path.join(path_cov, f"{filename}_covariance")
+
+    filename += f"_{compsep_run['field']}_{config.fwhm_out}acm_ns{nside_}_lmax{config.lmax}"
+    if nl_scale is not None:
+        filename += f"_nl{nl_scale}"
+
+    if compsep_run["nsim"] is None:
+        np.save(filename, cov_n)
+    else:
+#        if int(compsep_run["nsim"]) == 0:
+#            filename += f"_1sims"
+#            np.save(filename, cov_n)
+#        elif int(compsep_run["nsim"]) > 0:
+#            filename_prev = filename + f"_{int(compsep_run['nsim'])}sims.npy"
+#            filename += f"_{int(compsep_run['nsim']) + 1}sims"
+#            if not os.path.exists(filename_prev):
+#                raise FileNotFoundError(f"Nuisance covariance file {filename_prev} not found for updating.")
+#            np.save(filename, (np.load(filename_prev) * int(compsep_run["nsim"]) + cov_n) / (int(compsep_run["nsim"]) + 1))
+        files = [f for f in os.listdir(path_cov) if f.startswith(os.path.basename(filename)) and f.endswith(".npy")]
+
+        def get_num_sims(f):
+            m = re.search(r"_(\d+)sims\.npy$", f)
+            return int(m.group(1)) if m else None
+
+        max_sims = max([get_num_sims(f) for f in files], default=None)
+        if max_sims is None:
+            filename += f"_1sims"
+            np.save(filename, cov_n)
+        else:
+            filename_prev = filename + f"_{int(max_sims)}sims.npy"
+            filename += f"_{int(max_sims + 1)}sims"
+            np.save(filename, (np.load(filename_prev) * int(max_sims) + cov_n) / (int(max_sims) + 1))
+            os.remove(filename_prev)
+
+    return None
+
+
+def load_nuiscov(
+    config: Configs,
+    path_cov: str,
+    compsep_run: Dict,
+    nside_: int,
+    nl_scale: Optional[Union[int, None]] = None,
+    include_noise: bool = True,
+    include_cmb: bool = True) -> None:
+    """
+    Load nuisance covariance matrices from disk.
+
+    Parameters
+    ----------
+        config : Configs
+            Configuration object.
+        path_cov : str
+            Path to the nuisance covariance matrix to be loaded.
+        compsep_run : dict
+            Dictionary with parameters for nuisance covariance computation.
+        nside_ : int
+            HEALPix NSIDE resolution of the nuisance covariance.
+        nl_scale : int, optional
+            Needlet scale index associated with the nuisance covariance.
+        include_noise : bool
+            Whether to include noise in the filename.
+        include_cmb : bool
+            Whether to include CMB in the filename.
+    
+    Returns
+    -------
+        None
+            It loads, updates, and saves the nuisance covariance matrices to disk in the specified directory structure
+    """
+    if include_cmb and include_noise:
+        filename = "cmb+noise"
+    elif include_cmb and not include_noise:
+        filename = "cmb"
+    elif not include_cmb and include_noise:
+        filename = "noise"
+    else:
+        raise ValueError("At least one of include_cmb or include_noise must be True for loading nuisance covariance.")
+
+    filename = os.path.join(path_cov, f"{filename}_covariance")
+
+    filename += f"_{compsep_run['field']}_{config.fwhm_out}acm_ns{nside_}_lmax{config.lmax}"
+    if nl_scale is not None:
+        filename += f"_nl{nl_scale}"
+
+    files = [f for f in os.listdir(path_cov) if f.startswith(os.path.basename(filename)) and f.endswith(".npy")]
+
+    def get_num_sims(f):
+        m = re.search(r"_(\d+)sims\.npy$", f)
+        return int(m.group(1)) if m else None
+
+    max_sims = max([get_num_sims(f) for f in files], default=None)
+    if max_sims is None:
+        _log(f"No nuisance covariance found from nuisance simulations. Looking for file: {filename}.npy", config.verbose)
+        filename += ".npy"
+    else:
+        filename += f"_{int(max_sims)}sims.npy"
+
+    if not os.path.exists(filename):
+        raise FileNotFoundError(f"Nuisance covariance file {filename} not found.")
+    return np.load(filename)
+
 def save_patches(
     config: Configs,
     patches: np.ndarray,
@@ -538,7 +785,7 @@ def save_patches(
     path_ = os.path.join(compsep_run["path_out"], "patches")
     os.makedirs(path_, exist_ok=True)
     filename = os.path.join(path_, 
-            f"patches_{compsep_run['field']}_{config.fwhm_out}acm_ns{config.nside}_lmax{config.lmax}")
+            f"patches_{compsep_run['field']}_{config.fwhm_out}acm_ns{config.nside}_lmax{config.lmax}_nsim{config.nsim_start}")
     if nl_scale is not None:
         filename += f"_nl{nl_scale}"
     np.save(filename, patches)
@@ -606,10 +853,12 @@ def get_path_spectra(config: Configs, compute_cls: Dict[str, Any]) -> str:
     mask_patterns = ['GAL*+fgres', 'GAL*+fgtemp', 'GAL*+fgtemp^3','GAL*0', 'GAL97', 'GAL99', 'fgres', 'fgtemp', 
             'fgtemp^3', 'config+fgres', 'config+fgtemp', 'config+fgtemp^3', 'config']
 
-    if compute_cls["mask_type"] is None and config.mask_path is None:
+    if compute_cls["mask_type"] is None and config.mask_observations is None and config.mask_covariance is None:
         mask_name = 'fullsky'
-    elif compute_cls["mask_type"] is None and config.mask_path is not None:
+    elif compute_cls["mask_type"] is None and config.mask_observations is not None and config.mask_covariance is None:
         mask_name = "fullpatch"
+    elif compute_cls["mask_type"] is None and config.mask_observations is None and config.mask_covariance is not None:
+        mask_name = "covmask"
     elif any(fnmatch.fnmatch(compute_cls["mask_type"], pattern) for pattern in mask_patterns):
         if 'fgres' in compute_cls["mask_type"] or 'fgtemp' in compute_cls["mask_type"]:
             mask_name = compute_cls["mask_type"] + f"_fsky{compute_cls['fsky']}"
@@ -667,4 +916,46 @@ __all__ = [
     if callable(obj) and getattr(obj, "__module__", None) == __name__
 ]
                     
+
+
+def _load_ilc_weights(
+    config: Configs,
+    compsep_run: Dict,
+    nside_: int,
+    nl_scale: Optional[Union[int, None]] = None
+) -> None:
+    """
+    Save ILC component separation weights to disk with appropriate metadata in filename.
+
+    Parameters
+    ----------
+        config : Configs
+            Configuration object.
+        w : np.ndarray
+            component separation weights to be saved.
+        compsep_run : dict
+            Dictionary with component separation parameters.
+        nside_ : int
+            HEALPix NSIDE resolution of the output.
+        nl_scale : int, optional
+            Needlet scale index for the corresponding ILC run.
+
+    Returns
+    -------
+        None
+            It saves the weights to disk in the specified directory structure
+            based on the component separation method and configuration.
+    """
+    path_w = os.path.join(compsep_run["saved_run"], "weights")
+    os.makedirs(path_w, exist_ok=True)
+    filename = os.path.join(path_w, f"weights_{compsep_run['field']}_{config.fwhm_out}acm_ns{nside_}_lmax{config.lmax}")
+    if nl_scale is not None:
+        filename += f"_nl{nl_scale}"
+    if compsep_run["nsim"] is not None:
+        filename = filename
+
+    filename += f".npy"
+    print("loading the weights at " + filename)
+    w = np.load(filename)
+    return w
 

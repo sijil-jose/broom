@@ -263,12 +263,13 @@ def _cls_from_maps(
 
     compute_cls["mask"] = _get_mask(config, compute_cls, nsim=nsim)
 
-    if compute_cls["apodize_mask"] is not None:
-        compute_cls["mask"] = _smooth_masks(
-            compute_cls["mask"],
-            compute_cls["apodize_mask"],
-            compute_cls["smooth_mask"]
-        )
+    if not (compute_cls["mask_type"] is None and config.mask_observations is None and config.mask_covariance is None):
+        if compute_cls["apodize_mask"] is not None:
+            compute_cls["mask"] = _smooth_masks(
+                compute_cls["mask"],
+                compute_cls["apodize_mask"],
+                compute_cls["smooth_mask"]
+            )
 
     cls_out = _get_cls(config, compute_cls, nsim=nsim)
 
@@ -365,7 +366,7 @@ def _get_cls(config: Configs, compute_cls, nsim=None):
         return b_bin.bin_cell(cl)
     
     if 'purify' in compute_cls["path"]: # or 'maskonly' in compute_cls["path"]:
-        _log('Output maps are weighted by config mask. This will be taken into account.', verbose=config.verbose)
+        _log('Output maps have been weighted by config mask. This will be taken into account.', verbose=config.verbose)
 #        mask_in_maps = _preprocess_mask(hp.read_map(config.mask_path, field=0), config.nside)
         mask_in_maps, _ = get_masks_for_compsep(config.mask_observations, config.mask_covariance, config.nside)
         mask_in_maps /= np.max(mask_in_maps)

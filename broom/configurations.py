@@ -191,10 +191,17 @@ class Configs:
 #        base_dir = os.path.abspath(os.path.join(os.path.dirname(__file__), '..'))
         base_dir = os.path.abspath(os.path.dirname(__file__))
 
-        self.npipe = self.config.get("npipe", False)     
         self.lmin = self.config.get("lmin") or 2    
         self.lmax = self.config.get("lmax") or 2 * self.nside
         self.nside_in = self.config.get("nside_in") or self.nside
+        self.npipe = self.config.get("npipe", False)
+        if self.npipe == True:
+            self.npipe_data = self.config.get("npipe_data", False)
+            self.split = self.config.get("split", None)
+        self.load_weights = self.config.get("load_weights", False)
+
+        self.lmin_in = self.config.get("lmin_in") or 2 
+        self.lmax_in = self.config.get("lmax_in") or (3 * self.nside_in -1)
         self.fwhm_out = self.config.get("fwhm_out") or 2.5 * hp.nside2resol(self.nside, arcmin=True)
         self.verbose = self.config.get("verbose", False)
         self.nsim_start = self.config.get("nsim_start") or 0
@@ -205,6 +212,8 @@ class Configs:
         self.compsep_residuals = self.config.get("compsep_residuals") or ""
         self.real_mc_tracers = self.config.get("real_mc_tracers") or ""
         self.combine_outputs = self.config.get("combine_outputs") or ""
+        self.compsep_propagate = self.config.get("compsep_propagate") or ""
+        self.nuisance_covariance = self.config.get("nuisance_covariance") or ""
         self.foreground_models = self.config.get("foreground_models") or ["d0","s0"]
         self.field_in = self.config.get("field_in") or "TQU"
         self.field_out = self.config.get("field_out") or "TQU"
@@ -219,7 +228,7 @@ class Configs:
         self.mask_observations = self.config.get("mask_observations", None)
         self.mask_covariance = self.config.get("mask_covariance", None)
         self.leakage_correction = self.config.get("leakage_correction", None)
-        if self.compsep or self.compsep_residuals or self.combine_outputs:
+        if self.compsep or self.compsep_residuals or self.combine_outputs or self.compsep_propagate:
             self.save_compsep_products = self.config.get("save_compsep_products", True)
             self.return_compsep_products = self.config.get("return_compsep_products", False)
             if not self.save_compsep_products and not self.return_compsep_products:
@@ -232,33 +241,47 @@ class Configs:
         self.generate_input_cmb = self.config.get("generate_input_cmb", True)
         self.generate_input_data = self.config.get("generate_input_data", True)
         self.bandpass_integrate = self.config.get("bandpass_integrate", False)
-        if self.generate_input_foregrounds or self.generate_input_noise or self.generate_input_cmb or self.generate_input_data:
-            self.save_inputs = self.config.get("save_inputs", False)
+        self.save_inputs = self.config.get("save_inputs", False)
         if self.generate_input_noise:
             self.seed_noise = self.config.get("seed_noise", None)
+        self.data_splits = self.config.get("data_splits", False)
+        self.only_splits = self.config.get("only_splits", False)
         if self.generate_input_cmb:
             self.seed_cmb = self.config.get("seed_cmb", None)
         self.cls_cmb_path = self.config.get("cls_cmb_path") or os.path.join(base_dir, "utils", "Cls_Planck2018_lensed_r0.fits")
         self.cls_cmb_new_ordered = self.config.get("cls_cmb_new_ordered", True)
 
         # Input/output paths   
-        dataname = f"total_{self.data_type}_ns{self.nside}_lmax{self.lmax}"
-        def_data_path = os.path.join(os.getcwd(), "inputs", self.experiment, "total", ''.join(self.foreground_models), dataname)
+        if (self.generate_input_data and self.save_inputs) or (not self.generate_input_data):
+            dataname = f"total_{self.data_type}_ns{self.nside}_lmax{self.lmax}"
+            def_data_path = os.path.join(os.getcwd(), "inputs", self.experiment, "total", ''.join(self.foreground_models), dataname)
+        else:
+            def_data_path = None
         self.data_path = self.config.get("data_path") or def_data_path
 #        self.data_path = os.path.normpath(os.path.join(os.getcwd(), self.data_path))
-
-        noisename = f"noise_{self.data_type}_ns{self.nside}_lmax{self.lmax}"
-        def_noise_path = os.path.join(os.getcwd(), "inputs", self.experiment, "noise", noisename)
+        
+        if (self.generate_input_noise and self.save_inputs) or (not self.generate_input_noise and self.generate_input_data):
+            noisename = f"noise_{self.data_type}_ns{self.nside}_lmax{self.lmax}"
+            def_noise_path = os.path.join(os.getcwd(), "inputs", self.experiment, "noise", noisename)
+        else:
+            def_noise_path = None
         self.noise_path = self.config.get("noise_path") or def_noise_path
 #        self.noise_path = os.path.normpath(os.path.join(os.getcwd(), self.noise_path))
 
-        cmbname = f"cmb_{self.data_type}_ns{self.nside}_lmax{self.lmax}"
-        def_cmb_path = os.path.join(os.getcwd(), "inputs", self.experiment, "cmb", cmbname)
+        if (self.generate_input_cmb and self.save_inputs) or (not self.generate_input_cmb and self.generate_input_data):
+            cmbname = f"cmb_{self.data_type}_ns{self.nside}_lmax{self.lmax}"
+            def_cmb_path = os.path.join(os.getcwd(), "inputs", self.experiment, "cmb", cmbname)
+        else:
+            def_cmb_path = None
         self.cmb_path = self.config.get("cmb_path") or def_cmb_path
+        
 #        self.cmb_path = os.path.normpath(os.path.join(os.getcwd(), self.cmb_path))
 
-        fgdsname = f"foregrounds_{self.data_type}_ns{self.nside}_lmax{self.lmax}"
-        def_fgds_path = os.path.join(os.getcwd(), "inputs", self.experiment, "foregrounds", ''.join(self.foreground_models), fgdsname)
+        if self.generate_input_foregrounds and self.save_inputs:
+            fgdsname = f"foregrounds_{self.data_type}_ns{self.nside}_lmax{self.lmax}"
+            def_fgds_path = os.path.join(os.getcwd(), "inputs", self.experiment, "foregrounds", ''.join(self.foreground_models), fgdsname)
+        else:
+            def_fgds_path = None
         self.fgds_path = self.config.get("fgds_path") or def_fgds_path
 #        self.fgds_path = os.path.normpath(os.path.join(os.getcwd(), self.fgds_path))
 
@@ -281,8 +304,11 @@ class Configs:
             ['fgds_path', 'noise_path', 'cmb_path', 'data_path'],
             [self.generate_input_foregrounds, self.generate_input_noise, self.generate_input_cmb, self.generate_input_data]
         ):
-            if ((not flag) or self.save_inputs) and not getattr(self, name):
-                raise ValueError(f"Path '{name}' must be specified.")
+            if (flag and self.save_inputs) and not getattr(self, name):
+                raise ValueError(f"Path '{name}' must be specified, if 'save_inputs' is True and the corresponding input is asked to be generated.")
+
+        if not self.generate_input_data and not getattr(self, 'data_path'):
+            raise ValueError("Path 'data_path' must be specified if 'generate_input_data' is False.")
 
     def _load_experiment_parameters(self):
         experiments_yaml_path = self.experiments_file

@@ -6,7 +6,7 @@ from .spectra import nmt
 import os
 import sys
 
-from .routines import _slice_outputs, obj_out_to_array, _slice_data
+from .routines import _slice_outputs, obj_out_to_array, _slice_data, change_coord_mask
 from .configurations import Configs
 
 REMOTE = 'https://irsa.ipac.caltech.edu/data/Planck/release_2/'
@@ -16,7 +16,7 @@ import astropy
 from typing import Any, Dict, Optional, Union, Tuple
 
 
-def _preprocess_mask(mask: np.ndarray, nside_out: int) -> np.ndarray:
+def _preprocess_mask(mask: np.ndarray, nside_out: int, threshold: float = 0.5) -> np.ndarray:
     """
     Preprocess a HEALPix mask by adjusting its resolution and assessing if it is binary or hits map.
 
@@ -26,6 +26,8 @@ def _preprocess_mask(mask: np.ndarray, nside_out: int) -> np.ndarray:
             The input HEALPix mask, assumed to be a 1D array.
         nside_out : int
             Desired output NSIDE resolution.
+        threshold : float, optional
+            Threshold for binarizing the mask when downgrading resolution.
 
     Returns
     -------
@@ -47,7 +49,7 @@ def _preprocess_mask(mask: np.ndarray, nside_out: int) -> np.ndarray:
                 mask = _upgrade_mask(mask, nside_out)
             elif nside_mask > nside_out:
                 print("Provided mask has higher HEALPix resolution than that required for outputs. Mask will be downgraded to the output resolution.")
-                mask = _downgrade_mask(mask, nside_out, threshold=0.5)
+                mask = _downgrade_mask(mask, nside_out, threshold=threshold)
         except:
             raise ValueError("Invalid mask. It must be a valid HEALPix mask.")
         return mask
@@ -93,9 +95,13 @@ def _downgrade_mask(mask: np.ndarray, nside_out: int, threshold: float = 0.5) ->
             The downgraded (possibly binarized) mask.
     """
     if is_binary_mask(mask):
+        if hp.get_nside(mask) > 512 and nside_out < 512:
+            mask = hp.ud_grade(mask, 512)
         mask = hp.ud_grade(mask, nside_out)
         return (mask > threshold).astype(float)
     else:
+        if hp.get_nside(mask) > 512 and nside_out < 512:
+            mask = hp.ud_grade(mask, 512, power=-2)
         return hp.ud_grade(mask, nside_out, power=-2)
 
 def is_binary_mask(mask: np.ndarray) -> bool:
@@ -201,14 +207,15 @@ def _get_mask(config: Configs, compute_cls: Dict[str, Any], nsim: Optional[str] 
             if compute_cls["mask_type"][:5] not in gal_masks_list:
                 raise ValueError("GAL mask must be one of {}".format(", ".join(gal_masks_list)))
             idx_m = gal_masks_list.index(compute_cls["mask_type"][:5])
-            rot = hp.Rotator(coord=f"G{config.coordinates}") if config.coordinates != "G" else None
+            #rot = hp.Rotator(coord=f"G{config.coordinates}") if config.coordinates != "G" else None
             mask_init = hp.ud_grade(get_planck_mask(0, field=idx_m, nside=512),hp.npix2nside(npix))
             # Applying coordinate rotation if needed
             if config.coordinates != "G":
-                alm_mask = hp.map2alm(mask_init, lmax=2*hp.npix2nside(npix), pol=False)
-                rot.rotate_alm(alm_mask, inplace=True)
-                mask_init = hp.alm2map(alm_mask, nside_out=hp.npix2nside(npix), lmax=2*hp.npix2nside(npix), pol=False)
-            mask_init = mask_init == 1.
+                #alm_mask = hp.map2alm(mask_init, lmax=2*hp.npix2nside(npix), pol=False)
+                #rot.rotate_alm(alm_mask, inplace=True)
+                #mask_init = hp.alm2map(alm_mask, nside=hp.npix2nside(npix), lmax=2*hp.npix2nside(npix), pol=False)
+                mask_init = change_coord_mask(mask_init, ["G",config.coordinates])
+            mask_init = mask_init >= 1.
         elif 'config' in compute_cls["mask_type"]:
 #            mask_init = np.ones(npix) if config.mask_path is None else _preprocess_mask(hp.read_map(config.mask_path, field=0), config.nside)
             if config.mask_observations is not None or config.mask_covariance is not None:

@@ -2,9 +2,9 @@ import numpy as np
 import healpy as hp
 from .configurations import Configs
 from .routines import _get_local_cov, _EB_to_QU, _E_to_QU, _B_to_QU, obj_to_array, array_to_obj, _get_bandwidths
-from .saving import _save_compsep_products, _get_full_path_out, save_ilc_weights
+from .saving import _save_compsep_products, _get_full_path_out, save_ilc_weights, _get_full_path_nuiscov, load_nuiscov
 from .needlets import _get_nside_lmax_from_b_ell, _get_needlet_windows_, _needlet_filtering, _get_good_channels_nl
-from .ilcs import _standardize_cilc, get_inv_cov
+from .ilcs import get_inv_cov
 from .leakage import purify_master, purify_recycling
 from .seds import _get_CMB_SED, _get_moments_SED, _standardize_cilc
 from types import SimpleNamespace
@@ -76,25 +76,23 @@ def pilc(config: Configs, input_alms: SimpleNamespace, compsep_run: Dict[str, An
     if config.field_out not in ["E", "B", "QU", "EB", "QU_E", "QU_B"]:
         raise ValueError("Invalid field_out for PILC. It must be E, B, QU, EB, QU_E, or QU_B.")
 
-    if compsep_run["method"] == "cpilc" or compsep_run["method"] == "c_pilc":
+    if compsep_run["method"] in ["cpilc", "c_pilc"]:
         compsep_run = _standardize_cilc(compsep_run, config.lmax)
 
     if np.any(np.array(compsep_run["cov_noise_debias"]) != 0.):
-        if not hasattr(input_alms, "noise"):
-            raise ValueError("The input_alms object must have 'noise'' attribute for debiasing the covariance.")
-        compsep_run["noise_idx"] = 2 if hasattr(input_alms, "fgds") else 1
+        if not ("load_noise_covariance" in compsep_run and compsep_run["load_noise_covariance"]):
+            if not hasattr(input_alms, "noise"):
+                raise ValueError("The input_alms object must have 'noise'' attribute for debiasing the covariance.")
+            compsep_run["noise_idx"] = 2 if hasattr(input_alms, "fgds") else 1
 
+    input_attrs = obj_to_array(input_alms, return_attributes=True)
     output_maps = _pilc(config, obj_to_array(input_alms), compsep_run, **kwargs)
     
-    outputs = array_to_obj(output_maps, input_alms)
+    outputs = array_to_obj(output_maps, input_attrs)
 
     del output_maps
 
-    if config.save_compsep_products:
-        _save_compsep_products(config, outputs, compsep_run, nsim=compsep_run["nsim"])
-    if config.return_compsep_products:
-        return outputs
-    return None
+    return outputs, compsep_run
 
 def _pilc(config: Configs, input_alms: np.ndarray, compsep_run: Dict[str, Any], **kwargs) -> np.ndarray:
     """
@@ -421,7 +419,12 @@ def _pilc_maps(
     cov = get_prilc_cov(input_maps[...,0], config.lmax, compsep_run, b_ell)
     noise_debias = compsep_run["cov_noise_debias"] if compsep_run["domain"] == "pixel" else compsep_run["cov_noise_debias"][nl_scale]
     if noise_debias != 0.:
-        cov_n = get_prilc_cov(input_maps[...,compsep_run["noise_idx"]], config.lmax, compsep_run, b_ell)
+        if not ("load_noise_covariance" in compsep_run and compsep_run["load_noise_covariance"]):
+            cov_n = get_prilc_cov(input_maps[...,compsep_run["noise_idx"]], config.lmax, compsep_run, b_ell)
+        else:
+            path_noicov = _get_full_path_nuiscov(config, compsep_run)
+            cov_n = (load_nuiscov(config, path_noicov, compsep_run,
+                                hp.npix2nside(input_maps.shape[-2]), nl_scale=nl_scale, include_noise=True, include_cmb=False)).T
         cov = cov - noise_debias * cov_n
         del cov_n
 
@@ -521,10 +524,10 @@ def get_pilc_weights(
             )
 
             for i in range(input_shapes[0]):
-                if "mask" in compsep_run:
-                    w_ilc[i] = w_[i]
-                else:
-                    w_ilc[i]=hp.ud_grade(w_[i],hp.npix2nside(input_shapes[-2]))
+                #if "mask" in compsep_run:
+                #    w_ilc[i] = w_[i]
+                #else:
+                w_ilc[i]=hp.ud_grade(w_[i],hp.npix2nside(input_shapes[-2]))
             del w_, inv_ACA
     else:
         if compsep_run["ilc_bias"] == 0.:
@@ -534,12 +537,11 @@ def get_pilc_weights(
             AT_invC = np.einsum('j,ijk->ik', A_cmb, inv_cov) # np.sum(inv_cov,axis=1)
             AT_invC_A = np.einsum('j,ijk, i->k', A_cmb, inv_cov, A_cmb) #np.sum(inv_cov,axis=(0,1))
             for i in range(input_shapes[0]):
-                if "mask" in compsep_run:
-                    w_ilc[i] = AT_invC[i]/AT_invC_A
-                else:
-                    w_ilc[i]=hp.ud_grade(AT_invC[i]/AT_invC_A,hp.npix2nside(input_shapes[-2]))
+                #if "mask" in compsep_run:
+                #    w_ilc[i] = AT_invC[i]/AT_invC_A
+                #else:
+                w_ilc[i]=hp.ud_grade(AT_invC[i]/AT_invC_A,hp.npix2nside(input_shapes[-2]))
     return w_ilc
-
 
 def get_pilc_cov(
     input_maps: np.ndarray,
@@ -570,15 +572,23 @@ def get_pilc_cov(
     if compsep_run["ilc_bias"] == 0.:
         if "mask" in compsep_run:
             mask = compsep_run["mask"] > 0.
-            cov_qq_uu = np.mean(np.einsum('ik,jk->ijk', input_maps[:, 0, mask], input_maps[:, 0, mask]), axis=-1) + \
-                        np.mean(np.einsum('ik,jk->ijk', input_maps[:, 1, mask], input_maps[:, 1, mask]), axis=-1)
-            cov_qu_uq = np.mean(np.einsum('ik,jk->ijk', input_maps[:, 0, mask], input_maps[:, 1, mask]), axis=-1) - \
-                        np.mean(np.einsum('ik,jk->ijk', input_maps[:, 1, mask], input_maps[:, 0, mask]), axis=-1)
+#            cov_qq_uu = np.mean(np.einsum('ik,jk->ijk', input_maps[:, 0, mask], input_maps[:, 0, mask]), axis=-1) + \
+#                        np.mean(np.einsum('ik,jk->ijk', input_maps[:, 1, mask], input_maps[:, 1, mask]), axis=-1)
+#            cov_qu_uq = np.mean(np.einsum('ik,jk->ijk', input_maps[:, 0, mask], input_maps[:, 1, mask]), axis=-1) - \
+#                        np.mean(np.einsum('ik,jk->ijk', input_maps[:, 1, mask], input_maps[:, 0, mask]), axis=-1)
+            cov_qq_uu = (np.einsum('ik,jk->ij', input_maps[:, 0, mask], input_maps[:, 0, mask]) + \
+                        np.einsum('ik,jk->ij', input_maps[:, 1, mask], input_maps[:, 1, mask])) / np.sum(mask)
+            cov_qu_uq = (np.einsum('ik,jk->ij', input_maps[:, 0, mask], input_maps[:, 1, mask]) - \
+                        np.einsum('ik,jk->ij', input_maps[:, 1, mask], input_maps[:, 0, mask])) / np.sum(mask)
         else:
-            cov_qq_uu = np.mean(np.einsum('ik,jk->ijk', input_maps[:, 0], input_maps[:, 0]), axis=-1) + \
-                        np.mean(np.einsum('ik,jk->ijk', input_maps[:, 1], input_maps[:, 1]), axis=-1)
-            cov_qu_uq = np.mean(np.einsum('ik,jk->ijk', input_maps[:, 0], input_maps[:, 1]), axis=-1) - \
-                        np.mean(np.einsum('ik,jk->ijk', input_maps[:, 1], input_maps[:, 0]), axis=-1)
+#            cov_qq_uu = np.mean(np.einsum('ik,jk->ijk', input_maps[:, 0], input_maps[:, 0]), axis=-1) + \
+#                        np.mean(np.einsum('ik,jk->ijk', input_maps[:, 1], input_maps[:, 1]), axis=-1)
+#            cov_qu_uq = np.mean(np.einsum('ik,jk->ijk', input_maps[:, 0], input_maps[:, 1]), axis=-1) - \
+#                        np.mean(np.einsum('ik,jk->ijk', input_maps[:, 1], input_maps[:, 0]), axis=-1)
+            cov_qq_uu = (np.einsum('ik,jk->ij', input_maps[:, 0], input_maps[:, 0]) + \
+                        np.einsum('ik,jk->ij', input_maps[:, 1], input_maps[:, 1])) / input_maps.shape[-1]
+            cov_qu_uq = (np.einsum('ik,jk->ij', input_maps[:, 0], input_maps[:, 1]) - \
+                        np.einsum('ik,jk->ij', input_maps[:, 1], input_maps[:, 0])) / input_maps.shape[-1]
     else:
         mask = compsep_run.get("mask")
         reduce_bias = compsep_run["reduce_ilc_bias"]
@@ -588,15 +598,25 @@ def get_pilc_cov(
         cov_qu_uq = _get_local_cov(input_maps[:, 0], lmax, compsep_run["ilc_bias"], b_ell = b_ell, mask=mask, reduce_bias=reduce_bias, input_maps_2=input_maps[:, 1]) - \
                     _get_local_cov(input_maps[:, 1], lmax, compsep_run["ilc_bias"], b_ell = b_ell, mask=mask, reduce_bias=reduce_bias, input_maps_2=input_maps[:, 0])
 
-        if mask is not None and cov_qq_uu.shape[-1] == input_maps.shape[-1]:
-            valid = mask > 0.0
-            fallback_cov_qq_uu = np.mean(np.einsum('ik,jk->ijk', input_maps[:, 0, valid], input_maps[:, 0, valid]), axis=-1) + \
-                           np.mean(np.einsum('ik,jk->ijk', input_maps[:, 1, valid], input_maps[:, 1, valid]), axis=-1)
-            cov_qq_uu[..., mask == 0.0] = fallback_cov_qq_uu
-            fallback_cov_qu_uq = np.mean(np.einsum('ik,jk->ijk', input_maps[:, 0, valid], input_maps[:, 1, valid]), axis=-1) - \
-                           np.mean(np.einsum('ik,jk->ijk', input_maps[:, 1, valid], input_maps[:, 0, valid]), axis=-1)
-            cov_qu_uq[..., mask == 0.0] = np.repeat(fallback_cov_qu_uq[..., np.newaxis], np.sum(mask == 0.0), axis=-1)
-    
+        #if mask is not None and cov_qq_uu.shape[-1] == input_maps.shape[-1]:
+        #    valid = mask > 0.0
+        #    fallback_cov_qq_uu = np.mean(np.einsum('ik,jk->ijk', input_maps[:, 0, valid], input_maps[:, 0, valid]), axis=-1) + \
+        #                   np.mean(np.einsum('ik,jk->ijk', input_maps[:, 1, valid], input_maps[:, 1, valid]), axis=-1)
+        #    cov_qq_uu[..., mask == 0.0] = fallback_cov_qq_uu
+        #    fallback_cov_qu_uq = np.mean(np.einsum('ik,jk->ijk', input_maps[:, 0, valid], input_maps[:, 1, valid]), axis=-1) - \
+        #                   np.mean(np.einsum('ik,jk->ijk', input_maps[:, 1, valid], input_maps[:, 0, valid]), axis=-1)
+        #    cov_qu_uq[..., mask == 0.0] = np.repeat(fallback_cov_qu_uq[..., np.newaxis], np.sum(mask == 0.0), axis=-1)
+        mask_cov = (cov_qq_uu[0,0,:] != 0.).astype(float) * (cov_qu_uq[0,0,:] != 0.).astype(float)
+        if np.sum(mask_cov == 0.) > 0:
+            mask_valid = mask_cov > 0.0
+            fallback_cov_qq_uu = (np.einsum('ik,jk->ij', input_maps[:, 0, mask_valid], input_maps[:, 0, mask_valid]) + \
+                            np.einsum('ik,jk->ij', input_maps[:, 1, mask_valid], input_maps[:, 1, mask_valid])) / np.sum(mask_valid)
+            cov_qq_uu[..., mask_cov == 0.0] = np.repeat(fallback_cov_qq_uu[..., np.newaxis], np.sum(mask_cov == 0.0), axis=-1)
+            fallback_cov_qu_uq = (np.einsum('ik,jk->ij', input_maps[:, 0, mask_valid], input_maps[:, 1, mask_valid]) - \
+                            np.einsum('ik,jk->ij', input_maps[:, 1, mask_valid], input_maps[:, 0, mask_valid])) / np.sum(mask_valid)
+            cov_qu_uq[..., mask_cov == 0.0] = np.repeat(fallback_cov_qu_uq[..., np.newaxis], np.sum(mask_cov == 0.0), axis=-1)
+            del fallback_cov_qq_uu, fallback_cov_qu_uq
+
     cov = np.concatenate((
         np.concatenate((cov_qq_uu, -cov_qu_uq), axis=1),
         np.concatenate((cov_qu_uq, cov_qq_uu), axis=1)
@@ -632,11 +652,15 @@ def get_prilc_cov(
     if compsep_run["ilc_bias"] == 0.:
         if "mask" in compsep_run:
             mask = compsep_run["mask"] > 0.0
-            cov = np.mean(np.einsum('ik,jk->ijk', input_maps[:, 0, mask], input_maps[:, 0, mask]), axis=-1) + \
-                  np.mean(np.einsum('ik,jk->ijk', input_maps[:, 1, mask], input_maps[:, 1, mask]), axis=-1)
+#            cov = np.mean(np.einsum('ik,jk->ijk', input_maps[:, 0, mask], input_maps[:, 0, mask]), axis=-1) + \
+#                  np.mean(np.einsum('ik,jk->ijk', input_maps[:, 1, mask], input_maps[:, 1, mask]), axis=-1)
+            cov = (np.einsum('ik,jk->ij', input_maps[:, 0, mask], input_maps[:, 0, mask]) + \
+                  np.einsum('ik,jk->ij', input_maps[:, 1, mask], input_maps[:, 1, mask])) / np.sum(mask)
         else:
-            cov = np.mean(np.einsum('ik,jk->ijk', input_maps[:, 0], input_maps[:, 0]), axis=-1) + \
-                  np.mean(np.einsum('ik,jk->ijk', input_maps[:, 1], input_maps[:, 1]), axis=-1)
+#            cov = np.mean(np.einsum('ik,jk->ijk', input_maps[:, 0], input_maps[:, 0]), axis=-1) + \
+#                  np.mean(np.einsum('ik,jk->ijk', input_maps[:, 1], input_maps[:, 1]), axis=-1)
+            cov = (np.einsum('ik,jk->ij', input_maps[:, 0], input_maps[:, 0]) + \
+                  np.einsum('ik,jk->ij', input_maps[:, 1], input_maps[:, 1])) / input_maps.shape[-1]
 
     else:
         mask = compsep_run.get("mask")
@@ -645,11 +669,17 @@ def get_prilc_cov(
         cov = _get_local_cov(input_maps[:, 0], lmax, compsep_run["ilc_bias"], b_ell = b_ell, mask=mask, reduce_bias=reduce_bias) + \
               _get_local_cov(input_maps[:, 1], lmax, compsep_run["ilc_bias"], b_ell = b_ell, mask=mask, reduce_bias=reduce_bias)
 
-        if mask is not None and cov.shape[-1] == input_maps.shape[-1]:
-            mask_valid = mask > 0.0
-            fallback_cov = np.mean(np.einsum('ik,jk->ijk', input_maps[:, 0, mask_valid], input_maps[:, 0, mask_valid]), axis=-1) + \
-                           np.mean(np.einsum('ik,jk->ijk', input_maps[:, 1, mask_valid], input_maps[:, 1, mask_valid]), axis=-1)
-            cov[..., mask == 0.0] = np.repeat(fallback_cov[..., np.newaxis], np.sum(mask == 0.0), axis=-1)
+        #if mask is not None and cov.shape[-1] == input_maps.shape[-1]:
+        #    mask_valid = mask > 0.0
+        #    fallback_cov = np.mean(np.einsum('ik,jk->ijk', input_maps[:, 0, mask_valid], input_maps[:, 0, mask_valid]), axis=-1) + \
+        #                   np.mean(np.einsum('ik,jk->ijk', input_maps[:, 1, mask_valid], input_maps[:, 1, mask_valid]), axis=-1)
+        #    cov[..., mask == 0.0] = np.repeat(fallback_cov[..., np.newaxis], np.sum(mask == 0.0), axis=-1)
+        mask_cov = (cov[0,0,:] != 0.).astype(float)
+        if np.sum(mask_cov == 0.) > 0:
+            mask_valid = mask_cov > 0.0
+            fallback_cov = (np.einsum('ik,jk->ij', input_maps[:, 0, mask_valid], input_maps[:, 0, mask_valid]) + \
+                           np.einsum('ik,jk->ijk', input_maps[:, 1, mask_valid], input_maps[:, 1, mask_valid])) / np.sum(mask_valid)
+            cov[..., mask_cov == 0.0] = np.repeat(fallback_cov[..., np.newaxis], np.sum(mask_cov == 0.0), axis=-1)
 
     return cov
 
